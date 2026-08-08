@@ -12,6 +12,9 @@ Deploy as a Databricks App using app.yaml.
 import logging
 import os
 import re
+import json as _json
+from functools import lru_cache
+from weather_client import WeatherClient 
 
 import requests
 from databricks.sdk import WorkspaceClient
@@ -29,6 +32,18 @@ _w = WorkspaceClient()
 TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
 WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
 NEWS_TABLE_NAME = os.environ.get("NEWS_TABLE_NAME", "ticker_news_documents")
+WEATHER_DOCS_TABLE = os.environ.get("WEATHER_DOCS_TABLE", "weather_documents")
+WEATHER_EMB_TABLE = os.environ.get("WEATHER_EMB_TABLE", "weather_embeddings")
+EMBEDDING_MODEL_NAME = os.environ.get(
+    "EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"
+)
+EMBED_DIM = 384
+
+DEFAULT_WEATHER_LOCATIONS = [
+    s.strip()
+    for s in os.environ.get("WEATHER_LOCATIONS", "Chicago, IL;Austin, TX").split(";")
+    if s.strip()
+]
 
 # Tickers to fetch news for by default (comma-separated), e.g. "AAPL,MSFT,GOOGL"
 DEFAULT_NEWS_TICKERS = [
@@ -101,6 +116,55 @@ def ensure_news_table():
         f"CREATE INDEX IF NOT EXISTS idx_{NEWS_TABLE_NAME}_ticker "
         f"ON {NEWS_TABLE_NAME} (ticker)"
     )
+
+def ensure_weather_documents_table():
+    """Create the raw weather documents table if it doesn't exist yet."""
+    lakebase.run_write(
+        f"""
+        CREATE TABLE IF NOT EXISTS {WEATHER_DOCS_TABLE} (
+            id             TEXT PRIMARY KEY,
+            location       TEXT NOT NULL,
+            source_type    TEXT NOT NULL,
+            headline       TEXT,
+            narrative_text TEXT NOT NULL,
+            issued_at      TIMESTAMPTZ,
+            payload        JSONB NOT NULL,
+            synced_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    lakebase.run_write(
+        f"CREATE INDEX IF NOT EXISTS idx_{WEATHER_DOCS_TABLE}_source_type "
+        f"ON {WEATHER_DOCS_TABLE} (source_type)"
+    )
+
+
+def ensure_weather_embeddings_table():
+    """Create the embeddings table (vector(384)) + HNSW index if it doesn't exist."""
+    lakebase.run_write("CREATE EXTENSION IF NOT EXISTS vector")
+    lakebase.run_write(
+        f"""
+        CREATE TABLE IF NOT EXISTS {WEATHER_EMB_TABLE} (
+            id          TEXT PRIMARY KEY,
+            document_id TEXT NOT NULL REFERENCES {WEATHER_DOCS_TABLE}(id) ON DELETE CASCADE,
+            chunk_index INT  NOT NULL,
+            chunk_text  TEXT NOT NULL,
+            embedding   vector({EMBED_DIM}) NOT NULL,
+            model_name  TEXT NOT NULL,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    lakebase.run_write(
+        f"CREATE INDEX IF NOT EXISTS idx_{WEATHER_EMB_TABLE}_hnsw "
+        f"ON {WEATHER_EMB_TABLE} USING hnsw (embedding vector_cosine_ops)"
+    )
+
+@lru_cache(maxsize=1)
+def _get_embedding_model():
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
 
 def _current_user_email() -> str:
@@ -284,6 +348,72 @@ def delete_from_watchlist(symbol: str):
         return jsonify({"error": f"{symbol} is not on your watchlist"}), 404
 
     return jsonify({"symbol": symbol, "email": email, "deleted": True})
+@app.route("/weather/sync", methods=["POST"])
+def sync_weather():
+    """
+    Harvest active alerts + forecast narrative text for each location from the
+    National Weather Service API and upsert them into weather_documents.
+
+    Body (optional JSON): {"locations": ["Chicago, IL", "Austin, TX"], "limit": 50}
+    Defaults to DEFAULT_WEATHER_LOCATIONS when none supplied.
+    """
+    ensure_weather_documents_table()
+    client = WeatherClient()
+    body = request.json if request.is_json else {}
+    locations = body.get("locations") or DEFAULT_WEATHER_LOCATIONS
+    locations = [s.strip() for s in locations if isinstance(s, str) and s.strip()]
+    limit = int(body.get("limit", 50))
+
+    total = 0
+    for location in locations:
+        try:
+            docs = client.get_documents(location, limit=limit)
+        except Exception as exc:  # skip a bad location, don't fail the whole sync
+            logger.warning("Weather sync failed for %s: %s", location, exc)
+            continue
+        total += _upsert_weather_batch(docs)
+
+    return jsonify({"synced": total, "locations": locations})
+
+
+@app.route("/weather/search", methods=["POST"])
+def search_weather():
+    """
+    Semantic search over weather_embeddings using pgvector cosine distance (<=>).
+
+    Body (JSON): {"query": "flash flood risk this weekend", "top_k": 5}
+    Returns the top matches with location, headline, chunk_text, and similarity.
+    """
+    ensure_weather_embeddings_table()
+    body = request.json if request.is_json else {}
+    query = (body.get("query") or "").strip()
+    if not query:
+        return jsonify({"error": "Missing or empty 'query'"}), 400
+
+    # Clamp top_k to a sane 1..20 range.
+    try:
+        top_k = int(body.get("top_k", 5))
+    except (TypeError, ValueError):
+        top_k = 5
+    top_k = max(1, min(top_k, 20))
+
+    model = _get_embedding_model()
+    vec = model.encode(query).tolist()
+    vec_str = "[" + ",".join(str(float(x)) for x in vec) + "]"
+
+    rows = lakebase.run_query(
+        f"""
+        SELECT d.id, d.location, d.headline, d.narrative_text, e.chunk_text,
+               1 - (e.embedding <=> %s::vector) AS similarity
+        FROM {WEATHER_EMB_TABLE} e
+        JOIN {WEATHER_DOCS_TABLE} d ON d.id = e.document_id
+        ORDER BY e.embedding <=> %s::vector
+        LIMIT %s
+        """,
+        (vec_str, vec_str, top_k),
+    )
+    # Empty embeddings table simply yields an empty result list.
+    return jsonify({"query": query, "top_k": top_k, "results": rows})
 
 
 def _extract_latest_price(data: dict) -> float | None:
@@ -403,6 +533,44 @@ def _upsert_news_batch(ticker: str, articles: list[dict]) -> int:
                 )
                 count += 1
             conn.commit()
+    return count
+
+def _upsert_weather_batch(docs: list[dict]) -> int:
+    """Upsert normalized weather documents into weather_documents (dedup on id)."""
+    count = 0
+    with lakebase.get_connection() as conn:
+        with conn.cursor() as cur:
+            for doc in docs:
+                if not doc.get("id") or not doc.get("narrative_text"):
+                    continue
+                cur.execute(
+                    f"""
+                    INSERT INTO {WEATHER_DOCS_TABLE} (
+                        id, location, source_type, headline,
+                        narrative_text, issued_at, payload, synced_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+                    ON CONFLICT (id) DO UPDATE SET
+                        location       = EXCLUDED.location,
+                        source_type    = EXCLUDED.source_type,
+                        headline       = EXCLUDED.headline,
+                        narrative_text = EXCLUDED.narrative_text,
+                        issued_at      = EXCLUDED.issued_at,
+                        payload        = EXCLUDED.payload,
+                        synced_at      = EXCLUDED.synced_at
+                    """,
+                    (
+                        str(doc["id"]),
+                        doc.get("location", ""),
+                        doc.get("source_type", ""),
+                        doc.get("headline"),
+                        doc["narrative_text"],
+                        doc.get("issued_at"),
+                        _json.dumps(doc.get("payload", {})),
+                    ),
+                )
+                count += 1
+        conn.commit()
     return count
 
 

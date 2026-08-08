@@ -14,4 +14,4 @@ env:
   - name: MASSIVE_SECRET_KEY
     value: "api-key"
   - name: WEATHER_USER_AGENT
-     value: "(your-app-name, your-email@example.com)"
+    value: "(your-app-name, your-email@example.com)"

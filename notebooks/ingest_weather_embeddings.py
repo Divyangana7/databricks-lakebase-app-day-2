@@ -17,7 +17,7 @@ Run it as a Databricks notebook (Run All) attached to a cluster, or as a plain
 script anywhere lakebase.get_connection() works.
 
 In a Databricks notebook, install deps first in a %pip cell:
-    %pip install sentence-transformers psycopg2-binary
+    %pip install sentence-transformers psycopg2-binary sqlalchemy
     dbutils.library.restartPython()
 """
 
@@ -26,9 +26,18 @@ import sys
 
 from psycopg2.extras import execute_values
 
-# When run from a notebook inside the repo's Git folder, make sure the repo root
-# (where lakebase.py lives) is importable.
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# Make the repo root (where lakebase.py lives) importable, whether this runs as
+# a notebook (no __file__) or as a plain script.
+try:
+    _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+except NameError:
+    # Notebook context: derive the folder from the notebook's own path.
+    _nb_path = (
+        dbutils.notebook.entry_point.getDbutils()
+        .notebook().getContext().notebookPath().get()
+    )
+    _repo_root = os.path.dirname(os.path.dirname("/Workspace" + _nb_path))
+sys.path.append(_repo_root)
 import lakebase  # noqa: E402
 
 # ---- configuration --------------------------------------------------------

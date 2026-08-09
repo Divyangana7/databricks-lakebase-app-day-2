@@ -34,6 +34,12 @@
       margin-bottom: 4px;
     }
 
+    h2 {
+      font-size: 20px;
+      font-weight: 700;
+      margin: 40px 0 4px;
+    }
+
     .hint {
       color: var(--muted);
       font-size: 13px;
@@ -59,7 +65,7 @@
     }
     label:first-child { margin-top: 0; }
 
-    input[type="text"] {
+    input[type="text"], input[type="number"] {
       width: 100%;
       padding: 10px 12px;
       margin-top: 6px;
@@ -68,7 +74,7 @@
       font-size: 14px;
       transition: border-color 0.15s ease;
     }
-    input[type="text"]:focus {
+    input[type="text"]:focus, input[type="number"]:focus {
       outline: none;
       border-color: var(--accent);
       box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
@@ -89,7 +95,7 @@
     button:hover { background: var(--accent-hover); }
     button:active { transform: translateY(1px); }
 
-    #result {
+    #result, #weather-status {
       margin-top: 16px;
       white-space: pre-wrap;
       background: #f6f6f6;
@@ -99,7 +105,7 @@
       font-size: 13px;
       color: var(--muted);
     }
-    #result:empty { display: none; }
+    #result:empty, #weather-status:empty { display: none; }
 
     table {
       width: 100%;
@@ -139,6 +145,36 @@
     }
     .delete-btn:hover { background: var(--danger); color: #fff; }
     .delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* Weather results */
+    .result-item {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-top: 12px;
+      background: #fff;
+    }
+    .result-item:first-child { margin-top: 0; }
+    .result-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+    }
+    .result-head strong { font-size: 14px; }
+    .result-loc { color: var(--muted); font-size: 12px; }
+    .result-sim {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent);
+      white-space: nowrap;
+    }
+    .result-text {
+      margin-top: 8px;
+      font-size: 13px;
+      color: var(--text);
+      line-height: 1.5;
+    }
   </style>
 </head>
 <body>
@@ -168,6 +204,33 @@
       </thead>
       <tbody id="watchlist-body"></tbody>
     </table>
+  </div>
+
+  <!-- ===================== WEATHER INTELLIGENCE ===================== -->
+  <h2>Weather Intelligence</h2>
+  <p class="hint">Harvest free-text weather documents from the National Weather Service into Lakebase, then search them by meaning (pgvector cosine similarity). Sync first, run the embedding notebook, then search.</p>
+
+  <div class="card">
+    <form id="weather-sync-form">
+      <label for="locations">Locations (comma-separated)</label>
+      <input type="text" id="locations" name="locations" value="Chicago, IL, Austin, TX" placeholder="Chicago, IL, Austin, TX">
+      <label for="sync-limit">Max documents per location</label>
+      <input type="number" id="sync-limit" name="sync-limit" value="50" min="1" max="200">
+      <button type="submit">Sync weather documents</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <form id="weather-search-form">
+      <label for="query">Search query</label>
+      <input type="text" id="query" name="query" placeholder="flash flood risk this weekend" required>
+      <label for="top-k">Number of results (top_k)</label>
+      <input type="number" id="top-k" name="top-k" value="5" min="1" max="20">
+      <button type="submit">Search weather</button>
+    </form>
+
+    <div id="weather-status"></div>
+    <div id="weather-results"></div>
   </div>
 
   <script>
@@ -264,6 +327,95 @@
     });
 
     loadWatchlist();
+
+    // ===================== WEATHER LOGIC =====================
+    const weatherStatus = document.getElementById("weather-status");
+    const weatherResults = document.getElementById("weather-results");
+
+    // "Chicago, IL, Austin, TX" -> ["Chicago, IL", "Austin, TX"]
+    // Pairs up "City" with the following 2-letter state token.
+    function parseLocations(raw) {
+      const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+      const out = [];
+      for (let i = 0; i < parts.length; i++) {
+        if (i + 1 < parts.length && /^[A-Za-z]{2}$/.test(parts[i + 1])) {
+          out.push(parts[i] + ", " + parts[i + 1].toUpperCase());
+          i++;
+        } else {
+          out.push(parts[i]);
+        }
+      }
+      return out;
+    }
+
+    document.getElementById("weather-sync-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const raw = document.getElementById("locations").value;
+      const locations = parseLocations(raw);
+      const limit = parseInt(document.getElementById("sync-limit").value, 10) || 50;
+      weatherStatus.textContent = "Syncing weather documents for: " + locations.join(" | ") + " ...";
+      weatherResults.innerHTML = "";
+      try {
+        const resp = await fetch("/weather/sync", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ locations, limit }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          weatherStatus.textContent = "Sync error: " + (data.error || resp.statusText);
+          return;
+        }
+        weatherStatus.textContent =
+          "Synced " + data.synced + " documents for: " + (data.locations || locations).join(" | ") +
+          ".\nNow run the embedding notebook, then search below.";
+      } catch (err) {
+        weatherStatus.textContent = "Sync request failed: " + err;
+      }
+    });
+
+    document.getElementById("weather-search-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const query = document.getElementById("query").value;
+      const topK = parseInt(document.getElementById("top-k").value, 10) || 5;
+      weatherStatus.textContent = "Searching...";
+      weatherResults.innerHTML = "";
+      try {
+        const resp = await fetch("/weather/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, top_k: topK }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          weatherStatus.textContent = "Search error: " + (data.error || resp.statusText);
+          return;
+        }
+        const results = data.results || [];
+        if (!results.length) {
+          weatherStatus.textContent = "No matches. Have you synced and embedded documents yet?";
+          return;
+        }
+        weatherStatus.textContent = "Top " + results.length + " matches for: \"" + data.query + "\"";
+        results.forEach((r) => {
+          const sim = (r.similarity !== null && r.similarity !== undefined)
+            ? Number(r.similarity).toFixed(3)
+            : "-";
+          const div = document.createElement("div");
+          div.className = "result-item";
+          div.innerHTML = `
+            <div class="result-head">
+              <strong>${r.headline || "(no headline)"} <span class="result-loc">${r.location || ""}</span></strong>
+              <span class="result-sim">${sim}</span>
+            </div>
+            <div class="result-text">${(r.chunk_text || "").replace(/</g, "&lt;")}</div>
+          `;
+          weatherResults.appendChild(div);
+        });
+      } catch (err) {
+        weatherStatus.textContent = "Search request failed: " + err;
+      }
+    });
   </script>
 </body>
 </html>
